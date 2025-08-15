@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "rapid-resolver": {
+      "command": "node",
+      "args": [
+        "mcp-oauth-proxy.js",
+        "--client-id",
+        "<Replace with your Rapid Resolver Client Id>",
+        "--client-secret",
+        "<Replace with your Rapid Resolver Client Secret>",
+        "--token-url",
+        "https://oauth.rapidresolver.com/api/oauth2/token",
+        "--mcp-server-url",
+        "https://mcp.rapidresolver.com/mcp",
+        "--scope",
+        "read write"
+      ]
+    }
+  }
+}
