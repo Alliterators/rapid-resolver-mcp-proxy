@@ -249,12 +249,12 @@ proxies/
 Test OAuth authentication:
 ```bash
 # Node.js
-node mcp-oauth-proxy.js --client-id "test" --client-secret "test" \
-  --token-url "https://httpbin.org/status/401" --mcp-server-url "https://example.com"
+node mcp-oauth-proxy.js --client-id "your-rapid-resolver-client-id" --client-secret "your-rapid-resolver-client-secret" \
+  --token-url "https://oauth.rapidresolver.com/api/oauth2/token" --mcp-server-url "https://mcp.rapidresolver.com/mcp"
 
 # Python  
-python3 mcp-oauth-proxy.py --client-id "test" --client-secret "test" \
-  --token-url "https://httpbin.org/status/401" --mcp-server-url "https://example.com"
+python mcp-oauth-proxy.py --client-id "your-rapid-resolver-client-id" --client-secret "your-rapid-resolver-client-secret" \
+  --token-url "https://oauth.rapidresolver.com/api/oauth2/token" --mcp-server-url "https://mcp.rapidresolver.com/mcp"
 ```
 
 ### Contributing
