@@ -149,9 +149,17 @@ class TokenManager {
      * Get a valid access token, refreshing if necessary
      */
     async get() {
-        if (this._token && this._expiresAt && new Date() < this._expiresAt) {
-            return this._token;
+        // Always check if token is expired or will expire soon (30 second buffer)
+        if (!this._token || !this._expiresAt || new Date() >= new Date(this._expiresAt.getTime() - 30000)) {
+            await this._refresh();
         }
+        return this._token;
+    }
+
+    /**
+     * Force refresh the token (used when receiving 401 errors)
+     */
+    async forceRefresh() {
         await this._refresh();
         return this._token;
     }
@@ -220,27 +228,46 @@ class MCPProxy {
                 await this._initializeSession();
             }
 
-            // Prepare request headers with OAuth token and session ID
-            const headers = {
-                'Authorization': `Bearer ${await this.tokenManager.get()}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json, text/event-stream',
-                'mcp-session-id': this.sessionId
-            };
-
-            const response = await httpPost(this.url, JSON.stringify(request), headers);
-
-            if (response.statusCode === 200 || response.statusCode === 202) {
-                return this._parseResponse(response, request.id);
-            }
-
-            logger.error(`MCP server error: HTTP ${response.statusCode}`);
-            return jsonrpcError(request.id, -32000, `Server error: ${response.statusCode}`);
+            return await this._makeRequest(request);
 
         } catch (error) {
             logger.error(`Proxy request failed: ${error.message}`);
             return jsonrpcError(request.id, -32603, `Internal error: ${error.message}`);
         }
+    }
+
+    /**
+     * Make a request with automatic token refresh on 401
+     */
+    async _makeRequest(request, retryCount = 0) {
+        // Prepare request headers with OAuth token and session ID
+        const headers = {
+            'Authorization': `Bearer ${await this.tokenManager.get()}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+            'mcp-session-id': this.sessionId
+        };
+
+        const response = await httpPost(this.url, JSON.stringify(request), headers);
+
+        if (response.statusCode === 200 || response.statusCode === 202) {
+            return this._parseResponse(response, request.id);
+        }
+
+        // Handle 401 Unauthorized - token might have expired
+        if (response.statusCode === 401 && retryCount === 0) {
+            logger.warning('Received 401 Unauthorized, refreshing token and retrying...');
+            try {
+                await this.tokenManager.forceRefresh();
+                return await this._makeRequest(request, retryCount + 1);
+            } catch (refreshError) {
+                logger.error(`Token refresh failed: ${refreshError.message}`);
+                return jsonrpcError(request.id, -32000, `Authentication failed: ${refreshError.message}`);
+            }
+        }
+
+        logger.error(`MCP server error: HTTP ${response.statusCode}`);
+        return jsonrpcError(request.id, -32000, `Server error: ${response.statusCode}`);
     }
 
     /**
@@ -263,13 +290,7 @@ class MCPProxy {
                 }
             };
 
-            const headers = {
-                'Authorization': `Bearer ${await this.tokenManager.get()}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json, text/event-stream'
-            };
-
-            const response = await httpPost(this.url, JSON.stringify(initRequest), headers);
+            const response = await this._makeInitRequest(initRequest);
 
             if (response.statusCode !== 200) {
                 throw new Error(`Failed to initialize session: ${response.statusCode}`);
@@ -291,8 +312,7 @@ class MCPProxy {
                 method: "notifications/initialized"
             };
 
-            headers['mcp-session-id'] = this.sessionId;
-            const notificationResponse = await httpPost(this.url, JSON.stringify(initializedNotification), headers);
+            const notificationResponse = await this._makeInitNotification(initializedNotification);
 
             if (notificationResponse.statusCode === 200 || notificationResponse.statusCode === 202) {
                 logger.info('MCP initialization handshake completed');
@@ -304,6 +324,51 @@ class MCPProxy {
             logger.error(`Session initialization failed: ${error.message}`);
             throw error;
         }
+    }
+
+    /**
+     * Make initialization request with token refresh handling
+     */
+    async _makeInitRequest(request, retryCount = 0) {
+        const headers = {
+            'Authorization': `Bearer ${await this.tokenManager.get()}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream'
+        };
+
+        const response = await httpPost(this.url, JSON.stringify(request), headers);
+
+        // Handle 401 Unauthorized during initialization
+        if (response.statusCode === 401 && retryCount === 0) {
+            logger.warning('Received 401 during initialization, refreshing token and retrying...');
+            await this.tokenManager.forceRefresh();
+            return await this._makeInitRequest(request, retryCount + 1);
+        }
+
+        return response;
+    }
+
+    /**
+     * Make initialization notification with token refresh handling
+     */
+    async _makeInitNotification(notification, retryCount = 0) {
+        const headers = {
+            'Authorization': `Bearer ${await this.tokenManager.get()}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+            'mcp-session-id': this.sessionId
+        };
+
+        const response = await httpPost(this.url, JSON.stringify(notification), headers);
+
+        // Handle 401 Unauthorized during notification
+        if (response.statusCode === 401 && retryCount === 0) {
+            logger.warning('Received 401 during notification, refreshing token and retrying...');
+            await this.tokenManager.forceRefresh();
+            return await this._makeInitNotification(notification, retryCount + 1);
+        }
+
+        return response;
     }
 
     /**

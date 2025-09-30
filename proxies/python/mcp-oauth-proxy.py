@@ -133,8 +133,18 @@ class TokenManager:
         Returns:
             Valid OAuth access token string
         """
-        if self._token and self._expires_at and datetime.now() < self._expires_at:
-            return self._token
+        # Always check if token is expired or will expire soon (30 second buffer)
+        if not self._token or not self._expires_at or datetime.now() >= (self._expires_at - timedelta(seconds=30)):
+            await asyncio.to_thread(self._refresh)
+        return self._token  # type: ignore
+
+    async def force_refresh(self) -> str:
+        """
+        Force refresh the token (used when receiving 401 errors).
+        
+        Returns:
+            New OAuth access token string
+        """
         await asyncio.to_thread(self._refresh)
         return self._token  # type: ignore
 
@@ -207,41 +217,64 @@ class MCPProxy:
                 log.info("Initializing MCP session...")
                 await self._initialize_session()
             
-            headers = {
-                "Authorization": f"Bearer {await self.tm.get()}",
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-                "mcp-session-id": self.session_id,
-            }
-                
-            status, body, response_headers = await asyncio.to_thread(
-                self._http_post_with_headers, self.url, json.dumps(request).encode(), headers
-            )
-            
-            if status in (200, 202):  # Accept both 200 OK and 202 Accepted
-                # For SSE responses, extract the JSON from the event stream
-                # HTTP headers are case-insensitive, so check both variations
-                content_type = (response_headers.get("content-type", "") or 
-                              response_headers.get("Content-Type", ""))
-                
-                if content_type.startswith("text/event-stream"):
-                    result = self._parse_sse_response(body.decode())
-                    return result
-                else:
-                    # Handle empty responses (common with 202 Accepted)
-                    body_str = body.decode().strip()
-                    if not body_str:
-                        # Return a success response for empty bodies
-                        return {"jsonrpc": "2.0", "id": request.get("id"), "result": {}}
-                    result = json.loads(body_str)
-                    return result
-            
-            log.error("MCP server error: HTTP %s", status)
-            return jsonrpc_error(request.get("id"), -32000, f"Server error: {status}")
+            return await self._make_request(request)
 
         except Exception as exc:
             log.error("Proxy request failed: %s", str(exc))
             return jsonrpc_error(request.get("id"), -32603, f"Internal error: {exc}")
+
+    async def _make_request(self, request: Dict[str, Any], retry_count: int = 0) -> Dict[str, Any]:
+        """
+        Make a request with automatic token refresh on 401.
+        
+        Args:
+            request: JSON-RPC request dictionary
+            retry_count: Number of retries attempted
+            
+        Returns:
+            JSON-RPC response dictionary
+        """
+        headers = {
+            "Authorization": f"Bearer {await self.tm.get()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "mcp-session-id": self.session_id,
+        }
+            
+        status, body, response_headers = await asyncio.to_thread(
+            self._http_post_with_headers, self.url, json.dumps(request).encode(), headers
+        )
+        
+        if status in (200, 202):  # Accept both 200 OK and 202 Accepted
+            # For SSE responses, extract the JSON from the event stream
+            # HTTP headers are case-insensitive, so check both variations
+            content_type = (response_headers.get("content-type", "") or 
+                          response_headers.get("Content-Type", ""))
+            
+            if content_type.startswith("text/event-stream"):
+                result = self._parse_sse_response(body.decode())
+                return result
+            else:
+                # Handle empty responses (common with 202 Accepted)
+                body_str = body.decode().strip()
+                if not body_str:
+                    # Return a success response for empty bodies
+                    return {"jsonrpc": "2.0", "id": request.get("id"), "result": {}}
+                result = json.loads(body_str)
+                return result
+        
+        # Handle 401 Unauthorized - token might have expired
+        if status == 401 and retry_count == 0:
+            log.warning("Received 401 Unauthorized, refreshing token and retrying...")
+            try:
+                await self.tm.force_refresh()
+                return await self._make_request(request, retry_count + 1)
+            except Exception as refresh_error:
+                log.error("Token refresh failed: %s", str(refresh_error))
+                return jsonrpc_error(request.get("id"), -32000, f"Authentication failed: {refresh_error}")
+        
+        log.error("MCP server error: HTTP %s", status)
+        return jsonrpc_error(request.get("id"), -32000, f"Server error: {status}")
     
     async def _initialize_session(self) -> None:
         """
@@ -266,15 +299,7 @@ class MCPProxy:
             }
         }
         
-        headers = {
-            "Authorization": f"Bearer {await self.tm.get()}",
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
-        
-        status, body, response_headers = await asyncio.to_thread(
-            self._http_post_with_headers, self.url, json.dumps(init_request).encode(), headers
-        )
+        status, body, response_headers = await self._make_init_request(init_request)
         
         if status != 200:
             log.error(f"Failed to initialize MCP session: HTTP {status}")
@@ -294,16 +319,71 @@ class MCPProxy:
             "method": "notifications/initialized"
         }
         
-        headers["mcp-session-id"] = self.session_id
-        
-        status, body, response_headers = await asyncio.to_thread(
-            self._http_post_with_headers, self.url, json.dumps(initialized_notification).encode(), headers
-        )
+        status, body, response_headers = await self._make_init_notification(initialized_notification)
         
         if status in (200, 202):  # 200 OK or 202 Accepted are both valid
             log.info("MCP initialization handshake completed")
         else:
             log.warning(f"Unexpected response to initialized notification: HTTP {status}")
+
+    async def _make_init_request(self, request: Dict[str, Any], retry_count: int = 0) -> tuple[int, bytes, Dict[str, str]]:
+        """
+        Make initialization request with token refresh handling.
+        
+        Args:
+            request: JSON-RPC request dictionary
+            retry_count: Number of retries attempted
+            
+        Returns:
+            Tuple of (status_code, response_body_bytes, response_headers_dict)
+        """
+        headers = {
+            "Authorization": f"Bearer {await self.tm.get()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        
+        status, body, response_headers = await asyncio.to_thread(
+            self._http_post_with_headers, self.url, json.dumps(request).encode(), headers
+        )
+        
+        # Handle 401 Unauthorized during initialization
+        if status == 401 and retry_count == 0:
+            log.warning("Received 401 during initialization, refreshing token and retrying...")
+            await self.tm.force_refresh()
+            return await self._make_init_request(request, retry_count + 1)
+        
+        return status, body, response_headers
+
+    async def _make_init_notification(self, notification: Dict[str, Any], retry_count: int = 0) -> tuple[int, bytes, Dict[str, str]]:
+        """
+        Make initialization notification with token refresh handling.
+        
+        Args:
+            notification: JSON-RPC notification dictionary
+            retry_count: Number of retries attempted
+            
+        Returns:
+            Tuple of (status_code, response_body_bytes, response_headers_dict)
+        """
+        headers = {
+            "Authorization": f"Bearer {await self.tm.get()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "mcp-session-id": self.session_id,
+        }
+        
+        status, body, response_headers = await asyncio.to_thread(
+            self._http_post_with_headers, self.url, json.dumps(notification).encode(), headers
+        )
+        
+        # Handle 401 Unauthorized during notification
+        if status == 401 and retry_count == 0:
+            log.warning("Received 401 during notification, refreshing token and retrying...")
+            await self.tm.force_refresh()
+            return await self._make_init_notification(notification, retry_count + 1)
+        
+        return status, body, response_headers
     
     def _parse_sse_response(self, sse_data: str) -> Dict[str, Any]:
         """
